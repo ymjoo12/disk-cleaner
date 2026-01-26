@@ -1,0 +1,21 @@
+[package]
+name = "disk-cleaner"
+version = "0.1.0"
+edition = "2021"
+description = "macOS Disk Cleaner CLI - Fast parallel disk space analyzer and cleaner"
+
+[dependencies]
+jwalk = "0.8"
+rayon = "1.10"
+indicatif = "0.17"
+dialoguer = "0.11"
+colored = "2.1"
+bytesize = "1.3"
+clap = { version = "4", features = ["derive"] }
+num_cpus = "1.16"
+chrono = "0.4"
+dirs = "5.0"
+
+[profile.release]
+opt-level = 3
+lto = true
