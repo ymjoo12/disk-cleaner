@@ -5,13 +5,19 @@ use colored::*;
 use dialoguer::{theme::ColorfulTheme, Confirm, MultiSelect};
 use indicatif::{ProgressBar, ProgressStyle};
 use jwalk::WalkDir;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
+
+const DOCKER_INFO_TIMEOUT: Duration = Duration::from_secs(2);
+const DOCKER_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
+const DOCKER_PRUNE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Parser)]
 #[command(name = "disk-cleaner")]
@@ -23,11 +29,59 @@ struct Args {
     #[arg(short = 'n', long, help = "Dry run - show what would be deleted")]
     dry_run: bool,
 
-    #[arg(short, long, default_value = "100", help = "Large file threshold in MB")]
+    #[arg(
+        short,
+        long,
+        default_value = "100",
+        help = "Large file threshold in MB"
+    )]
     large: u64,
 
     #[arg(short, long, help = "Number of scan threads (default: CPU cores)")]
     threads: Option<usize>,
+
+    #[arg(short, long, help = "Path to config file")]
+    config: Option<PathBuf>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Config {
+    exclude: Vec<String>,
+}
+
+impl Config {
+    fn default_path() -> PathBuf {
+        get_home_dir().join(".config/disk-cleaner/config.json")
+    }
+
+    fn load(path: Option<&Path>) -> Self {
+        let config_path = path.map(PathBuf::from).unwrap_or_else(Self::default_path);
+        if let Ok(content) = fs::read_to_string(&config_path) {
+            if let Ok(config) = serde_json::from_str::<Config>(&content) {
+                return config;
+            }
+            eprintln!(
+                "{} Failed to parse config: {}",
+                "!".yellow(),
+                config_path.display()
+            );
+        }
+        Config { exclude: vec![] }
+    }
+
+    fn expanded_excludes(&self) -> Vec<PathBuf> {
+        let home = get_home_dir();
+        self.exclude
+            .iter()
+            .map(|p| {
+                if let Some(stripped) = p.strip_prefix("~/") {
+                    home.join(stripped)
+                } else {
+                    PathBuf::from(p)
+                }
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone)]
@@ -51,7 +105,20 @@ struct DockerInfo {
     available: bool,
 }
 
+type CleanAction = Box<dyn Fn() -> io::Result<u64>>;
+type CleanableItem = (String, u64, CleanAction);
+
 impl DockerInfo {
+    fn unavailable() -> Self {
+        Self {
+            images: 0,
+            containers: 0,
+            volumes: 0,
+            build_cache: 0,
+            available: false,
+        }
+    }
+
     fn total(&self) -> u64 {
         self.images + self.containers + self.volumes + self.build_cache
     }
@@ -62,11 +129,19 @@ fn get_home_dir() -> PathBuf {
 }
 
 fn get_project_search_dirs(home: &Path) -> Vec<PathBuf> {
-    ["Codes", "Projects", "Documents", "Developer", "workspace", "repos", "src"]
-        .iter()
-        .map(|d| home.join(d))
-        .filter(|p| p.exists())
-        .collect()
+    [
+        "Codes",
+        "Projects",
+        "Documents",
+        "Developer",
+        "workspace",
+        "repos",
+        "src",
+    ]
+    .iter()
+    .map(|d| home.join(d))
+    .filter(|p| p.exists())
+    .collect()
 }
 
 fn get_categories() -> Vec<Category> {
@@ -75,9 +150,17 @@ fn get_categories() -> Vec<Category> {
         ("System Caches", "Library/Caches", true),
         ("App Logs", "Library/Logs", true),
         ("Trash", ".Trash", true),
-        ("Xcode DerivedData", "Library/Developer/Xcode/DerivedData", true),
+        (
+            "Xcode DerivedData",
+            "Library/Developer/Xcode/DerivedData",
+            true,
+        ),
         ("Xcode Archives", "Library/Developer/Xcode/Archives", false),
-        ("iOS Simulators", "Library/Developer/CoreSimulator/Devices", false),
+        (
+            "iOS Simulators",
+            "Library/Developer/CoreSimulator/Devices",
+            false,
+        ),
         ("npm Cache", ".npm", true),
         ("Yarn Cache", ".yarn", true),
         ("pnpm Cache", "Library/pnpm", true),
@@ -98,28 +181,60 @@ fn get_categories() -> Vec<Category> {
     .collect()
 }
 
+fn command_output_with_timeout(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> io::Result<Option<Output>> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let start = Instant::now();
+
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output().map(Some);
+        }
+
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn docker_command_output(args: &[&str], timeout: Duration) -> Option<Output> {
+    command_output_with_timeout("docker", args, timeout)
+        .ok()
+        .flatten()
+}
+
 fn is_docker_available() -> bool {
-    Command::new("docker")
-        .arg("info")
-        .output()
-        .map(|o| o.status.success())
+    docker_command_output(&["info"], DOCKER_INFO_TIMEOUT)
+        .map(|output| output.status.success())
         .unwrap_or(false)
 }
 
 fn get_docker_info() -> DockerInfo {
     if !is_docker_available() {
-        return DockerInfo {
-            images: 0,
-            containers: 0,
-            volumes: 0,
-            build_cache: 0,
-            available: false,
-        };
+        return DockerInfo::unavailable();
     }
 
-    let output = Command::new("docker")
-        .args(["system", "df", "--format", "{{.Type}}\t{{.Reclaimable}}"])
-        .output();
+    let Some(output) = docker_command_output(
+        &["system", "df", "--format", "{{.Type}}\t{{.Reclaimable}}"],
+        DOCKER_SCAN_TIMEOUT,
+    ) else {
+        return DockerInfo::unavailable();
+    };
+
+    if !output.status.success() {
+        return DockerInfo::unavailable();
+    }
 
     let mut info = DockerInfo {
         images: 0,
@@ -129,20 +244,16 @@ fn get_docker_info() -> DockerInfo {
         available: true,
     };
 
-    if let Ok(output) = output {
-        if output.status.success() {
-            for line in String::from_utf8_lossy(&output.stdout).lines() {
-                let parts: Vec<&str> = line.split('\t').collect();
-                if parts.len() >= 2 {
-                    let size = parse_docker_size(parts[1]);
-                    match parts[0] {
-                        "Images" => info.images = size,
-                        "Containers" => info.containers = size,
-                        "Local Volumes" => info.volumes = size,
-                        "Build Cache" => info.build_cache = size,
-                        _ => {}
-                    }
-                }
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() >= 2 {
+            let size = parse_docker_size(parts[1]);
+            match parts[0] {
+                "Images" => info.images = size,
+                "Containers" => info.containers = size,
+                "Local Volumes" => info.volumes = size,
+                "Build Cache" => info.build_cache = size,
+                _ => {}
             }
         }
     }
@@ -155,30 +266,38 @@ fn parse_docker_size(s: &str) -> u64 {
         return 0;
     }
 
-    let (num_str, multiplier) = if s.ends_with("GB") {
-        (&s[..s.len() - 2], 1_000_000_000.0)
-    } else if s.ends_with("MB") {
-        (&s[..s.len() - 2], 1_000_000.0)
-    } else if s.ends_with("KB") || s.ends_with("kB") {
-        (&s[..s.len() - 2], 1_000.0)
-    } else if s.ends_with("B") {
-        (&s[..s.len() - 1], 1.0)
+    let (num_str, multiplier) = if let Some(stripped) = s.strip_suffix("GB") {
+        (stripped, 1_000_000_000.0)
+    } else if let Some(stripped) = s.strip_suffix("MB") {
+        (stripped, 1_000_000.0)
+    } else if let Some(stripped) = s.strip_suffix("KB").or_else(|| s.strip_suffix("kB")) {
+        (stripped, 1_000.0)
+    } else if let Some(stripped) = s.strip_suffix("B") {
+        (stripped, 1.0)
     } else {
         return 0;
     };
 
-    num_str.trim().parse::<f64>().unwrap_or(0.0) as u64 * multiplier as u64
+    (num_str.trim().parse::<f64>().unwrap_or(0.0) * multiplier) as u64
 }
 
 fn docker_prune(resource: &str, args: &[&str]) -> io::Result<u64> {
-    let output = Command::new("docker").args(args).output()?;
+    let output =
+        command_output_with_timeout("docker", args, DOCKER_PRUNE_TIMEOUT)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("{resource} prune timed out because Docker did not respond"),
+            )
+        })?;
     if !output.status.success() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("{} prune failed: {}", resource, String::from_utf8_lossy(&output.stderr)),
-        ));
+        return Err(io::Error::other(format!(
+            "{resource} prune failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
     }
-    Ok(parse_docker_reclaimed(&String::from_utf8_lossy(&output.stdout)))
+    Ok(parse_docker_reclaimed(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
 }
 
 fn parse_docker_reclaimed(output: &str) -> u64 {
@@ -217,6 +336,7 @@ fn find_directories(
     threads: usize,
     max_depth: Option<usize>,
     validator: Option<fn(&Path) -> bool>,
+    excludes: &[PathBuf],
 ) -> Vec<(PathBuf, u64)> {
     let mut results = Vec::new();
 
@@ -238,6 +358,10 @@ fn find_directories(
                 continue;
             }
             let path = entry.path();
+
+            if excludes.iter().any(|ex| path.starts_with(ex)) {
+                continue;
+            }
 
             if target_name == "node_modules"
                 && path
@@ -303,16 +427,50 @@ fn format_time_ago(time: Option<SystemTime>) -> String {
             let datetime: DateTime<Local> = t.into();
             let days = Local::now().signed_duration_since(datetime).num_days();
             if days > 365 {
-                format!("{}년전", days / 365)
+                let years = days / 365;
+                format!("{years}년전")
             } else if days > 30 {
-                format!("{}개월전", days / 30)
+                let months = days / 30;
+                format!("{months}개월전")
             } else if days > 0 {
-                format!("{}일전", days)
+                format!("{days}일전")
             } else {
                 "최근".to_string()
             }
         }
         None => "-".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_timeout_returns_none_for_unresponsive_command() {
+        let output =
+            command_output_with_timeout("sh", &["-c", "sleep 2"], Duration::from_millis(20))
+                .expect("command should spawn");
+
+        assert!(output.is_none());
+    }
+
+    #[test]
+    fn command_timeout_captures_responsive_command_output() {
+        let output =
+            command_output_with_timeout("sh", &["-c", "printf ok"], Duration::from_secs(1))
+                .expect("command should spawn")
+                .expect("command should finish before timeout");
+
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "ok");
+    }
+
+    #[test]
+    fn parse_docker_size_keeps_decimal_units() {
+        assert_eq!(parse_docker_size("1.5GB (50%)"), 1_500_000_000);
+        assert_eq!(parse_docker_size("42.25MB"), 42_250_000);
+        assert_eq!(parse_docker_size("512kB"), 512_000);
     }
 }
 
@@ -353,22 +511,52 @@ fn delete_directory(path: &Path) -> io::Result<u64> {
 
 fn print_header() {
     println!();
-    println!("{}", "╭─────────────────────────────────────────────────────────────╮".bright_blue());
-    println!("{}", "│                    macOS Disk Cleaner                       │".bright_blue());
-    println!("{}", "╰─────────────────────────────────────────────────────────────╯".bright_blue());
+    println!(
+        "{}",
+        "╭─────────────────────────────────────────────────────────────╮".bright_blue()
+    );
+    println!(
+        "{}",
+        "│                    macOS Disk Cleaner                       │".bright_blue()
+    );
+    println!(
+        "{}",
+        "╰─────────────────────────────────────────────────────────────╯".bright_blue()
+    );
     println!();
 }
 
 fn print_table_header() {
-    println!("{}", "╭──────────────────────────────────────────────────────────────────────────────╮".bright_blue());
-    println!("{}", "│                         Disk Usage by Category                               │".bright_blue());
-    println!("{}", "├────────────────────────┬──────────────────────────────┬──────────────────────┤".bright_blue());
+    println!(
+        "{}",
+        "╭──────────────────────────────────────────────────────────────────────────────╮"
+            .bright_blue()
+    );
+    println!(
+        "{}",
+        "│                         Disk Usage by Category                               │"
+            .bright_blue()
+    );
+    println!(
+        "{}",
+        "├────────────────────────┬──────────────────────────────┬──────────────────────┤"
+            .bright_blue()
+    );
     println!(
         "{} {:<22} {} {:<28} {} {:>20} {}",
-        "│".bright_blue(), "Category".bold(), "│".bright_blue(),
-        "Location".bold(), "│".bright_blue(), "Size".bold(), "│".bright_blue()
+        "│".bright_blue(),
+        "Category".bold(),
+        "│".bright_blue(),
+        "Location".bold(),
+        "│".bright_blue(),
+        "Size".bold(),
+        "│".bright_blue()
     );
-    println!("{}", "├────────────────────────┼──────────────────────────────┼──────────────────────┤".bright_blue());
+    println!(
+        "{}",
+        "├────────────────────────┼──────────────────────────────┼──────────────────────┤"
+            .bright_blue()
+    );
 }
 
 fn print_table_row(name: &str, location: &str, size: u64) {
@@ -389,18 +577,35 @@ fn print_table_row(name: &str, location: &str, size: u64) {
 
     println!(
         "{} {:<22} {} {:<28} {} {:>20} {}",
-        "│".bright_blue(), name, "│".bright_blue(), loc, "│".bright_blue(), size_colored, "│".bright_blue()
+        "│".bright_blue(),
+        name,
+        "│".bright_blue(),
+        loc,
+        "│".bright_blue(),
+        size_colored,
+        "│".bright_blue()
     );
 }
 
 fn print_table_footer(total: u64) {
-    println!("{}", "├────────────────────────┴──────────────────────────────┼──────────────────────┤".bright_blue());
+    println!(
+        "{}",
+        "├────────────────────────┴──────────────────────────────┼──────────────────────┤"
+            .bright_blue()
+    );
     println!(
         "{} {:<52} {} {:>20} {}",
-        "│".bright_blue(), "TOTAL".bold(), "│".bright_blue(),
-        ByteSize(total).to_string().green().bold(), "│".bright_blue()
+        "│".bright_blue(),
+        "TOTAL".bold(),
+        "│".bright_blue(),
+        ByteSize(total).to_string().green().bold(),
+        "│".bright_blue()
     );
-    println!("{}", "╰───────────────────────────────────────────────────────┴──────────────────────╯".bright_blue());
+    println!(
+        "{}",
+        "╰───────────────────────────────────────────────────────┴──────────────────────╯"
+            .bright_blue()
+    );
 }
 
 fn main() {
@@ -409,16 +614,36 @@ fn main() {
     let home = get_home_dir();
     let min_large_file_size = args.large * 1024 * 1024;
     let project_dirs = get_project_search_dirs(&home);
+    let config = Config::load(args.config.as_deref());
+    let excludes = config.expanded_excludes();
 
     print_header();
 
+    if !excludes.is_empty() {
+        println!(
+            "{} {} excluded path(s) loaded from config",
+            "i".bright_blue(),
+            excludes.len()
+        );
+        println!();
+    }
+
     let pb = ProgressBar::new_spinner();
-    pb.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg}").unwrap());
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg}")
+            .unwrap(),
+    );
 
     pb.set_message("Scanning cache locations...");
     let categories = get_categories();
     let mut category_sizes: Vec<(Category, u64)> = categories
         .into_iter()
+        .filter(|c| {
+            !excludes
+                .iter()
+                .any(|ex| c.path.starts_with(ex) || ex.starts_with(&c.path))
+        })
         .map(|c| {
             let size = scan_directory(&c.path, threads);
             pb.tick();
@@ -429,17 +654,39 @@ fn main() {
     category_sizes.sort_by(|a, b| b.1.cmp(&a.1));
 
     pb.set_message("Scanning node_modules...");
-    let node_modules = find_directories(&project_dirs, "node_modules", threads, None, None);
+    let node_modules = find_directories(
+        &project_dirs,
+        "node_modules",
+        threads,
+        None,
+        None,
+        &excludes,
+    );
     let node_modules_total: u64 = node_modules.iter().map(|(_, s)| s).sum();
 
     pb.set_message("Scanning Python venvs...");
-    let venv_validator: fn(&Path) -> bool = |p| p.join("pyvenv.cfg").exists() || p.join("bin/python").exists();
-    let mut venvs = find_directories(&project_dirs, ".venv", threads, Some(5), Some(venv_validator));
-    venvs.extend(find_directories(&project_dirs, "venv", threads, Some(5), Some(venv_validator)));
+    let venv_validator: fn(&Path) -> bool =
+        |p| p.join("pyvenv.cfg").exists() || p.join("bin/python").exists();
+    let mut venvs = find_directories(
+        &project_dirs,
+        ".venv",
+        threads,
+        Some(5),
+        Some(venv_validator),
+        &excludes,
+    );
+    venvs.extend(find_directories(
+        &project_dirs,
+        "venv",
+        threads,
+        Some(5),
+        Some(venv_validator),
+        &excludes,
+    ));
     let venvs_total: u64 = venvs.iter().map(|(_, s)| s).sum();
 
     pb.set_message("Scanning __pycache__...");
-    let pycaches = find_directories(&project_dirs, "__pycache__", threads, None, None);
+    let pycaches = find_directories(&project_dirs, "__pycache__", threads, None, None, &excludes);
     let pycache_total: u64 = pycaches.iter().map(|(_, s)| s).sum();
 
     pb.set_message("Finding large files...");
@@ -461,15 +708,27 @@ fn main() {
     }
 
     if node_modules_total > 0 {
-        print_table_row("node_modules", &format!("{} directories", node_modules.len()), node_modules_total);
+        print_table_row(
+            "node_modules",
+            &format!("{} directories", node_modules.len()),
+            node_modules_total,
+        );
         total += node_modules_total;
     }
     if venvs_total > 0 {
-        print_table_row("Python .venv", &format!("{} directories", venvs.len()), venvs_total);
+        print_table_row(
+            "Python .venv",
+            &format!("{} directories", venvs.len()),
+            venvs_total,
+        );
         total += venvs_total;
     }
     if pycache_total > 0 {
-        print_table_row("__pycache__", &format!("{} directories", pycaches.len()), pycache_total);
+        print_table_row(
+            "__pycache__",
+            &format!("{} directories", pycaches.len()),
+            pycache_total,
+        );
         total += pycache_total;
     }
     if docker.available && docker.total() > 0 {
@@ -481,15 +740,39 @@ fn main() {
 
     if !large_files.is_empty() {
         println!();
-        println!("{}", "╭──────────────────────────────────────────────────────────────────────────────╮".bright_blue());
-        println!("{}", format!("│                    Large Files (>{}MB)                                       │", args.large).bright_blue());
-        println!("{}", "├──────────────────────────────────────────────────┬─────────────┬─────────────┤".bright_blue());
+        println!(
+            "{}",
+            "╭──────────────────────────────────────────────────────────────────────────────╮"
+                .bright_blue()
+        );
+        println!(
+            "{}",
+            format!(
+                "│                    Large Files (>{}MB)                                       │",
+                args.large
+            )
+            .bright_blue()
+        );
+        println!(
+            "{}",
+            "├──────────────────────────────────────────────────┬─────────────┬─────────────┤"
+                .bright_blue()
+        );
         println!(
             "{} {:<48} {} {:>11} {} {:>11} {}",
-            "│".bright_blue(), "File".bold(), "│".bright_blue(),
-            "Size".bold(), "│".bright_blue(), "Access".bold(), "│".bright_blue()
+            "│".bright_blue(),
+            "File".bold(),
+            "│".bright_blue(),
+            "Size".bold(),
+            "│".bright_blue(),
+            "Access".bold(),
+            "│".bright_blue()
         );
-        println!("{}", "├──────────────────────────────────────────────────┼─────────────┼─────────────┤".bright_blue());
+        println!(
+            "{}",
+            "├──────────────────────────────────────────────────┼─────────────┼─────────────┤"
+                .bright_blue()
+        );
 
         for file in &large_files {
             let short = shorten_path(&file.path, &home);
@@ -500,12 +783,20 @@ fn main() {
             };
             println!(
                 "{} {:<48} {} {:>11} {} {:>11} {}",
-                "│".bright_blue(), display, "│".bright_blue(),
-                ByteSize(file.size).to_string().yellow(), "│".bright_blue(),
-                format_time_ago(file.accessed), "│".bright_blue()
+                "│".bright_blue(),
+                display,
+                "│".bright_blue(),
+                ByteSize(file.size).to_string().yellow(),
+                "│".bright_blue(),
+                format_time_ago(file.accessed),
+                "│".bright_blue()
             );
         }
-        println!("{}", "╰──────────────────────────────────────────────────┴─────────────┴─────────────╯".bright_blue());
+        println!(
+            "{}",
+            "╰──────────────────────────────────────────────────┴─────────────┴─────────────╯"
+                .bright_blue()
+        );
     }
 
     if args.scan_only {
@@ -516,20 +807,28 @@ fn main() {
 
     println!();
 
-    let mut cleanable: Vec<(String, u64, Box<dyn Fn() -> io::Result<u64>>)> = Vec::new();
+    let mut cleanable: Vec<CleanableItem> = Vec::new();
 
     for (cat, size) in &category_sizes {
         if cat.safe_to_delete {
             let path = cat.path.clone();
             let name = format!("{} ({})", cat.name, ByteSize(*size));
-            cleanable.push((name, *size, Box::new(move || delete_directory_contents(&path))));
+            cleanable.push((
+                name,
+                *size,
+                Box::new(move || delete_directory_contents(&path)),
+            ));
         }
     }
 
     if node_modules_total > 0 {
         let paths: Vec<PathBuf> = node_modules.iter().map(|(p, _)| p.clone()).collect();
         cleanable.push((
-            format!("node_modules - {} dirs ({})", paths.len(), ByteSize(node_modules_total)),
+            format!(
+                "node_modules - {} dirs ({})",
+                paths.len(),
+                ByteSize(node_modules_total)
+            ),
             node_modules_total,
             Box::new(move || {
                 let mut freed = 0u64;
@@ -544,7 +843,11 @@ fn main() {
     if venvs_total > 0 {
         let paths: Vec<PathBuf> = venvs.iter().map(|(p, _)| p.clone()).collect();
         cleanable.push((
-            format!("Python .venv - {} dirs ({})", paths.len(), ByteSize(venvs_total)),
+            format!(
+                "Python .venv - {} dirs ({})",
+                paths.len(),
+                ByteSize(venvs_total)
+            ),
             venvs_total,
             Box::new(move || {
                 let mut freed = 0u64;
@@ -559,7 +862,11 @@ fn main() {
     if pycache_total > 0 {
         let paths: Vec<PathBuf> = pycaches.iter().map(|(p, _)| p.clone()).collect();
         cleanable.push((
-            format!("__pycache__ - {} dirs ({})", paths.len(), ByteSize(pycache_total)),
+            format!(
+                "__pycache__ - {} dirs ({})",
+                paths.len(),
+                ByteSize(pycache_total)
+            ),
             pycache_total,
             Box::new(move || {
                 let mut freed = 0u64;
@@ -621,11 +928,17 @@ fn main() {
         Ok(selected) if !selected.is_empty() => {
             let total_to_free: u64 = selected.iter().map(|&i| cleanable[i].1).sum();
             println!();
-            println!("Will free approximately {}", ByteSize(total_to_free).to_string().green().bold());
+            println!(
+                "Will free approximately {}",
+                ByteSize(total_to_free).to_string().green().bold()
+            );
 
             if args.dry_run {
                 println!();
-                println!("{}", "Dry run mode - no files will be deleted.".yellow().bold());
+                println!(
+                    "{}",
+                    "Dry run mode - no files will be deleted.".yellow().bold()
+                );
                 for &i in &selected {
                     println!("  - {}", cleanable[i].0);
                 }
@@ -661,7 +974,11 @@ fn main() {
 
                     pb.finish_and_clear();
                     println!();
-                    println!("{} Freed {}", "✓".green().bold(), ByteSize(freed).to_string().green().bold());
+                    println!(
+                        "{} Freed {}",
+                        "✓".green().bold(),
+                        ByteSize(freed).to_string().green().bold()
+                    );
 
                     if !errors.is_empty() {
                         println!();

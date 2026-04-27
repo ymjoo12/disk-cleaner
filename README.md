@@ -8,6 +8,7 @@ Fast parallel disk space analyzer and cleaner for macOS.
 - Cache/log cleanup (npm, pip, Homebrew, Xcode, etc.)
 - Project cleanup (node_modules, .venv, __pycache__)
 - Docker cleanup (images, containers, volumes, build cache)
+- Docker scan is skipped automatically when Docker is unavailable or unresponsive
 - Large file detection
 - Interactive selection with confirmation
 - Dry-run mode
@@ -68,3 +69,4 @@ disk-cleaner --large 500
 - All cleanup requires explicit user selection
 - Final confirmation prompt before any deletion (default: No)
 - Docker cleanup only removes unused resources
+- Docker cleanup options are hidden when Docker is unavailable or unresponsive
