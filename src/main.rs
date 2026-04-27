@@ -8,6 +8,7 @@ use jwalk::WalkDir;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,8 +16,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-const DOCKER_INFO_TIMEOUT: Duration = Duration::from_secs(2);
-const DOCKER_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
+const DOCKER_INFO_TIMEOUT: Duration = Duration::from_millis(750);
+const DOCKER_SCAN_TIMEOUT: Duration = Duration::from_secs(2);
 const DOCKER_PRUNE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Parser)]
@@ -214,7 +215,37 @@ fn docker_command_output(args: &[&str], timeout: Duration) -> Option<Output> {
         .flatten()
 }
 
+fn docker_socket_path_from_host(docker_host: Option<&str>, home: &Path) -> Option<PathBuf> {
+    match docker_host {
+        Some(host) if host.starts_with("unix://") => {
+            let path = host.trim_start_matches("unix://");
+            (!path.is_empty()).then(|| PathBuf::from(path))
+        }
+        Some(_) => None,
+        None => Some(home.join(".docker/run/docker.sock")),
+    }
+}
+
+fn docker_socket_path() -> Option<PathBuf> {
+    let docker_host = std::env::var("DOCKER_HOST").ok();
+    docker_socket_path_from_host(docker_host.as_deref(), &get_home_dir())
+}
+
+fn should_attempt_docker_cli() -> bool {
+    let Some(socket_path) = docker_socket_path() else {
+        return true;
+    };
+
+    fs::metadata(socket_path)
+        .map(|metadata| metadata.file_type().is_socket())
+        .unwrap_or(false)
+}
+
 fn is_docker_available() -> bool {
+    if !should_attempt_docker_cli() {
+        return false;
+    }
+
     docker_command_output(&["info"], DOCKER_INFO_TIMEOUT)
         .map(|output| output.status.success())
         .unwrap_or(false)
@@ -282,6 +313,10 @@ fn parse_docker_size(s: &str) -> u64 {
 }
 
 fn docker_prune(resource: &str, args: &[&str]) -> io::Result<u64> {
+    if !is_docker_available() {
+        return Ok(0);
+    }
+
     let output =
         command_output_with_timeout("docker", args, DOCKER_PRUNE_TIMEOUT)?.ok_or_else(|| {
             io::Error::new(
@@ -471,6 +506,36 @@ mod tests {
         assert_eq!(parse_docker_size("1.5GB (50%)"), 1_500_000_000);
         assert_eq!(parse_docker_size("42.25MB"), 42_250_000);
         assert_eq!(parse_docker_size("512kB"), 512_000);
+    }
+
+    #[test]
+    fn docker_socket_path_uses_default_desktop_socket() {
+        let home = Path::new("/Users/example");
+
+        assert_eq!(
+            docker_socket_path_from_host(None, home),
+            Some(PathBuf::from("/Users/example/.docker/run/docker.sock"))
+        );
+    }
+
+    #[test]
+    fn docker_socket_path_parses_unix_docker_host() {
+        let home = Path::new("/Users/example");
+
+        assert_eq!(
+            docker_socket_path_from_host(Some("unix:///tmp/docker.sock"), home),
+            Some(PathBuf::from("/tmp/docker.sock"))
+        );
+    }
+
+    #[test]
+    fn docker_socket_path_skips_non_unix_docker_host() {
+        let home = Path::new("/Users/example");
+
+        assert_eq!(
+            docker_socket_path_from_host(Some("tcp://127.0.0.1:2375"), home),
+            None
+        );
     }
 }
 
