@@ -11,6 +11,8 @@ Fast parallel disk space analyzer and cleaner for macOS.
 - Docker scan is skipped automatically when Docker is unavailable or unresponsive
 - Large file detection
 - Interactive selection with confirmation
+- Non-interactive cleanup by target ID or group
+- Runtime and saved exclude paths
 - Dry-run mode
 
 ## Installation
@@ -32,15 +34,81 @@ cargo build --release
 # Scan only (no cleanup)
 disk-cleaner --scan-only
 
-# Preview cleanup (dry run)
-disk-cleaner --dry-run
+# List clean target groups and IDs
+disk-cleaner --list-targets
+
+# Preview cleanup without prompts
+disk-cleaner --dry-run --clean all
+
+# Clean everything selectable without prompts
+disk-cleaner --clean all
+
+# Clean selected groups without prompts
+disk-cleaner --clean caches,projects,docker
+
+# Clean selected target IDs without prompts
+disk-cleaner --clean system-caches,npm-cache,node-modules
 
 # Interactive cleanup
 disk-cleaner
 
 # Custom large file threshold (default: 100MB)
 disk-cleaner --large 500
+
+# Exclude paths for one run
+disk-cleaner --scan-only --exclude ~/Codes/important --exclude ~/Downloads/keep
 ```
+
+## Saved Exclude Paths
+
+```bash
+# Save an exclude path
+disk-cleaner config add-exclude ~/Codes/important
+
+# Remove an exclude path
+disk-cleaner config remove-exclude ~/Codes/important
+
+# List saved exclude paths
+disk-cleaner config list
+
+# Print config path
+disk-cleaner config path
+```
+
+The default config path is `~/.config/disk-cleaner/config.json`.
+
+## Clean Targets
+
+Groups:
+
+- `all`
+- `caches`
+- `projects`
+- `docker`
+
+Target IDs:
+
+- `system-caches`
+- `app-logs`
+- `trash`
+- `xcode-deriveddata`
+- `npm-cache`
+- `yarn-cache`
+- `pnpm-cache`
+- `pip-cache`
+- `uv-cache`
+- `homebrew-cache`
+- `gradle-cache`
+- `maven-cache`
+- `cocoapods-cache`
+- `cargo-cache`
+- `node-modules`
+- `python-venvs`
+- `pycache`
+- `docker-images`
+- `docker-containers`
+- `docker-build-cache`
+- `docker-volumes`
 
 ## Scan Categories
 
@@ -66,7 +134,10 @@ disk-cleaner --large 500
 ## Safety
 
 - Categories marked "No" are shown but not selectable for cleanup
-- All cleanup requires explicit user selection
-- Final confirmation prompt before any deletion (default: No)
+- Interactive cleanup requires user selection
+- Interactive final confirmation defaults to Yes
+- Non-interactive cleanup runs only when `--clean` is provided
+- Use `--dry-run --clean <targets>` to preview the exact non-interactive selection
+- Permission errors are reported as warnings and do not stop later cleanup targets
 - Docker cleanup only removes unused resources
 - Docker cleanup options are hidden when Docker is unavailable or unresponsive

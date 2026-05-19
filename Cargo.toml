@@ -6,7 +6,6 @@ description = "macOS Disk Cleaner CLI - Fast parallel disk space analyzer and cl
 
 [dependencies]
 jwalk = "0.8"
-rayon = "1.10"
 indicatif = "0.17"
 dialoguer = "0.11"
 colored = "2.1"
