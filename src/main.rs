@@ -987,7 +987,10 @@ fn parse_clean_selection(input: &str, items: &[CleanableItem]) -> Result<Vec<usi
             .collect();
 
         if matches.is_empty() {
-            return Err(format!("unknown clean target: {token}"));
+            if !is_known_target(token) {
+                return Err(format!("unknown clean target: {token}"));
+            }
+            continue;
         }
 
         for index in matches {
@@ -998,10 +1001,14 @@ fn parse_clean_selection(input: &str, items: &[CleanableItem]) -> Result<Vec<usi
     }
 
     if selected.is_empty() {
-        return Err("no clean targets were provided".to_string());
+        return Err("no clean targets matched the current scan".to_string());
     }
 
     Ok(selected)
+}
+
+fn is_known_target(token: &str) -> bool {
+    matches!(token, "all" | "caches" | "projects" | "docker") || target_ids().contains(&token)
 }
 
 fn target_matches(token: &str, item: &CleanableItem) -> bool {
@@ -1267,7 +1274,13 @@ fn print_target_reference() {
     println!("  docker");
     println!();
     println!("Target IDs:");
-    for id in [
+    for id in target_ids() {
+        println!("  {id}");
+    }
+}
+
+fn target_ids() -> &'static [&'static str] {
+    &[
         "system-caches",
         "app-logs",
         "trash",
@@ -1289,9 +1302,7 @@ fn print_target_reference() {
         "docker-containers",
         "docker-build-cache",
         "docker-volumes",
-    ] {
-        println!("  {id}");
-    }
+    ]
 }
 
 fn print_header() {
@@ -1473,6 +1484,26 @@ mod tests {
         assert_eq!(
             parse_clean_selection("docker-images", &items).unwrap(),
             vec![2]
+        );
+    }
+
+    #[test]
+    fn clean_selection_ignores_known_empty_group() {
+        let items = vec![test_item("system-caches", TargetGroup::Caches, 10)];
+
+        assert_eq!(
+            parse_clean_selection("caches,docker", &items).unwrap(),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn clean_selection_rejects_only_empty_known_group() {
+        let items = vec![test_item("system-caches", TargetGroup::Caches, 10)];
+
+        assert_eq!(
+            parse_clean_selection("docker", &items).unwrap_err(),
+            "no clean targets matched the current scan"
         );
     }
 
