@@ -845,17 +845,15 @@ fn build_cleanable_items(results: &ScanResults, excludes: &[PathBuf]) -> Vec<Cle
     let mut cleanable = Vec::new();
 
     for (category, size) in &results.category_sizes {
-        if category.safe_to_delete {
-            let path = category.path.clone();
-            let excludes = excludes.to_vec();
-            cleanable.push(CleanableItem {
-                id: category.id,
-                group: TargetGroup::Caches,
-                label: format!("{} ({})", category.name, ByteSize(*size)),
-                size: *size,
-                action: Box::new(move || delete_directory_contents(&path, &excludes)),
-            });
-        }
+        let path = category.path.clone();
+        let excludes = excludes.to_vec();
+        cleanable.push(CleanableItem {
+            id: category.id,
+            group: TargetGroup::Caches,
+            label: format!("{} ({})", category.name, ByteSize(*size)),
+            size: *size,
+            action: Box::new(move || delete_directory_contents(&path, &excludes)),
+        });
     }
 
     push_path_collection(
@@ -1012,7 +1010,20 @@ fn is_known_target(token: &str) -> bool {
 }
 
 fn target_matches(token: &str, item: &CleanableItem) -> bool {
-    token == "all" || token == item.group.id() || token == item.id
+    if token == "all" || token == item.group.id() {
+        is_safe_to_delete(item.id)
+    } else {
+        token == item.id
+    }
+}
+
+fn is_safe_to_delete(id: &str) -> bool {
+    if let Ok(home) = get_home_dir() {
+        if let Some(category) = get_categories(&home).iter().find(|c| c.id == id) {
+            return category.safe_to_delete;
+        }
+    }
+    true
 }
 
 fn run_interactive_cleanup(cleanable: &[CleanableItem], dry_run: bool) {
@@ -1285,6 +1296,8 @@ fn target_ids() -> &'static [&'static str] {
         "app-logs",
         "trash",
         "xcode-deriveddata",
+        "xcode-archives",
+        "ios-simulators",
         "npm-cache",
         "yarn-cache",
         "pnpm-cache",
