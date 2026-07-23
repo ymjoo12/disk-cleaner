@@ -117,6 +117,8 @@ struct ArchivePolicy {
     exclude: Vec<String>,
     #[serde(default)]
     partition_by_date: bool,
+    #[serde(default)]
+    hardlink_aliases: Vec<String>,
 }
 
 impl Config {
@@ -205,6 +207,7 @@ struct ResolvedArchivePolicy {
     older_than: Duration,
     excludes: Vec<PathBuf>,
     partition_by_date: bool,
+    hardlink_aliases: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -214,6 +217,7 @@ struct ArchiveCandidate {
     size: u64,
     root: PathBuf,
     excludes: Vec<PathBuf>,
+    hardlink_aliases: Vec<PathBuf>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -226,6 +230,7 @@ struct RemoteObject {
 struct FileIdentity {
     device: u64,
     inode: u64,
+    link_count: u64,
     change_time_seconds: i64,
     change_time_nanoseconds: i64,
     size: u64,
@@ -250,6 +255,7 @@ enum DeleteAfterVerification {
     Deleted,
     VerificationMismatch,
     LocalChanged,
+    HardlinkMismatch,
 }
 
 #[derive(Default)]
@@ -605,12 +611,39 @@ fn resolve_archive_policies(
                 resolve_archive_exclude(exclude, &root, home)?,
             );
         }
+        let hardlink_aliases = policy
+            .hardlink_aliases
+            .iter()
+            .map(|alias| {
+                let path = normalize_path(Path::new(alias), home);
+                let resolved = fs::canonicalize(&path).map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!(
+                            "failed to resolve hardlink alias path {}: {error}",
+                            path.display()
+                        ),
+                    )
+                })?;
+                if !resolved.is_dir() || resolved == root {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "hardlink alias must be a distinct directory: {}",
+                            resolved.display()
+                        ),
+                    ));
+                }
+                Ok(resolved)
+            })
+            .collect::<io::Result<Vec<_>>>()?;
         resolved.push(ResolvedArchivePolicy {
             root,
             prefix: policy.prefix.clone(),
             older_than: Duration::from_secs(seconds),
             excludes,
             partition_by_date: policy.partition_by_date,
+            hardlink_aliases,
         });
     }
 
@@ -738,14 +771,14 @@ fn collect_archive_candidates(policies: &[ResolvedArchivePolicy]) -> ArchiveScan
                 continue;
             }
             let relative = match path.strip_prefix(&policy.root) {
-                Ok(relative) => relative,
+                Ok(relative) => relative.to_path_buf(),
                 Err(error) => {
                     errors.push(format!("{}: {error}", path.display()));
                     continue;
                 }
             };
             let partition_time = policy.partition_by_date.then_some(modified);
-            match build_archive_key(&policy.prefix, relative, partition_time) {
+            match build_archive_key(&policy.prefix, &relative, partition_time) {
                 Ok(key) => {
                     if let Some(previous) = key_sources.get(&key) {
                         errors.push(format!(
@@ -763,6 +796,11 @@ fn collect_archive_candidates(policies: &[ResolvedArchivePolicy]) -> ArchiveScan
                         size: metadata.len(),
                         root: policy.root.clone(),
                         excludes: policy.excludes.clone(),
+                        hardlink_aliases: policy
+                            .hardlink_aliases
+                            .iter()
+                            .map(|root| root.join(&relative))
+                            .collect(),
                     });
                 }
                 Err(error) => errors.push(format!("{}: {error}", path.display())),
@@ -885,7 +923,13 @@ fn archive_candidate(
         }
     };
 
-    match delete_after_verification(&candidate.path, &expected_identity, &sha256, &remote)? {
+    match delete_after_verification(
+        &candidate.path,
+        &candidate.hardlink_aliases,
+        &expected_identity,
+        &sha256,
+        &remote,
+    )? {
         DeleteAfterVerification::Deleted => Ok(expected_identity.size),
         DeleteAfterVerification::VerificationMismatch => Err(io::Error::other(format!(
             "remote verification failed for s3://{bucket}/{}; local file preserved",
@@ -895,6 +939,10 @@ fn archive_candidate(
             "local file changed during upload to s3://{bucket}/{}; local file preserved",
             candidate.key
         ))),
+        DeleteAfterVerification::HardlinkMismatch => Err(io::Error::other(format!(
+            "configured hardlink aliases changed during upload to s3://{bucket}/{}; local file preserved",
+            candidate.key
+        ))),
     }
 }
 
@@ -902,6 +950,7 @@ fn file_identity(metadata: &fs::Metadata) -> io::Result<FileIdentity> {
     Ok(FileIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
+        link_count: metadata.nlink(),
         change_time_seconds: metadata.ctime(),
         change_time_nanoseconds: metadata.ctime_nsec(),
         size: metadata.len(),
@@ -1057,6 +1106,7 @@ fn is_head_object_not_found(stderr: &str) -> bool {
 
 fn delete_after_verification(
     path: &Path,
+    hardlink_aliases: &[PathBuf],
     expected_identity: &FileIdentity,
     expected_sha256: &str,
     remote: &RemoteObject,
@@ -1070,6 +1120,27 @@ fn delete_after_verification(
     let metadata = fs::metadata(path)?;
     if file_identity(&metadata)? != *expected_identity {
         return Ok(DeleteAfterVerification::LocalChanged);
+    }
+    let mut matching_aliases = Vec::new();
+    for alias in hardlink_aliases {
+        let metadata = match fs::symlink_metadata(alias) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if !metadata.file_type().is_file() || file_identity(&metadata)? != *expected_identity {
+            return Ok(DeleteAfterVerification::HardlinkMismatch);
+        }
+        matching_aliases.push(alias);
+    }
+    if expected_identity.link_count != matching_aliases.len() as u64 + 1 {
+        return Ok(DeleteAfterVerification::HardlinkMismatch);
+    }
+    for alias in matching_aliases {
+        fs::remove_file(alias)?;
     }
     fs::remove_file(path)?;
     Ok(DeleteAfterVerification::Deleted)
@@ -2433,6 +2504,7 @@ mod tests {
         .unwrap();
 
         assert!(!config.archive[0].partition_by_date);
+        assert!(config.archive[0].hardlink_aliases.is_empty());
     }
 
     #[test]
@@ -2447,7 +2519,7 @@ mod tests {
             sha256: "incorrect".to_string(),
         };
 
-        let result = delete_after_verification(&path, &identity, "expected", &remote).unwrap();
+        let result = delete_after_verification(&path, &[], &identity, "expected", &remote).unwrap();
 
         assert_eq!(result, DeleteAfterVerification::VerificationMismatch);
         assert!(path.exists());
@@ -2497,10 +2569,66 @@ mod tests {
         };
 
         let result =
-            delete_after_verification(&path, &expected_identity, "expected", &remote).unwrap();
+            delete_after_verification(&path, &[], &expected_identity, "expected", &remote).unwrap();
 
         assert_eq!(result, DeleteAfterVerification::LocalChanged);
         assert!(path.exists());
+    }
+
+    #[test]
+    fn verified_hardlink_alias_is_deleted_with_local_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("archive.dat");
+        let alias = directory.path().join("archive-alias.dat");
+        fs::write(&path, b"archive payload").unwrap();
+        fs::hard_link(&path, &alias).unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let identity = file_identity(&metadata).unwrap();
+        let remote = RemoteObject {
+            content_length: metadata.len(),
+            sha256: "expected".to_string(),
+        };
+
+        let result = delete_after_verification(
+            &path,
+            std::slice::from_ref(&alias),
+            &identity,
+            "expected",
+            &remote,
+        )
+        .unwrap();
+
+        assert_eq!(result, DeleteAfterVerification::Deleted);
+        assert!(!path.exists());
+        assert!(!alias.exists());
+    }
+
+    #[test]
+    fn different_hardlink_alias_preserves_local_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("archive.dat");
+        let alias = directory.path().join("archive-alias.dat");
+        fs::write(&path, b"archive payload").unwrap();
+        fs::write(&alias, b"different payload").unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let identity = file_identity(&metadata).unwrap();
+        let remote = RemoteObject {
+            content_length: metadata.len(),
+            sha256: "expected".to_string(),
+        };
+
+        let result = delete_after_verification(
+            &path,
+            std::slice::from_ref(&alias),
+            &identity,
+            "expected",
+            &remote,
+        )
+        .unwrap();
+
+        assert_eq!(result, DeleteAfterVerification::HardlinkMismatch);
+        assert!(path.exists());
+        assert!(alias.exists());
     }
 
     #[test]
