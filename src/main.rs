@@ -1021,6 +1021,8 @@ fn upload_archive_file(
             profile,
             "--metadata",
             &metadata,
+            "--checksum-algorithm",
+            "SHA256",
             "--no-progress",
         ])
         .output()?;
