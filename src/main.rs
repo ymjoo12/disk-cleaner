@@ -902,17 +902,29 @@ fn archive_candidate(
     let existing = head_archive_object(&candidate.key, endpoint, bucket, profile)?;
     let remote = match existing {
         HeadArchiveObject::Missing => {
-            upload_archive_file(
+            let upload_result = upload_archive_file(
                 &candidate.path,
                 &candidate.key,
                 &sha256,
                 endpoint,
                 bucket,
                 profile,
-            )?;
+            );
             match head_archive_object(&candidate.key, endpoint, bucket, profile)? {
-                HeadArchiveObject::Found(remote) => remote,
+                HeadArchiveObject::Found(remote)
+                    if decide_archive_transfer(Some(&remote), expected_identity.size, &sha256)
+                        == ArchiveTransferDecision::ReuseExisting =>
+                {
+                    remote
+                }
+                HeadArchiveObject::Found(_) => {
+                    return Err(io::Error::other(format!(
+                        "uploaded object differs at s3://{bucket}/{}; local file preserved",
+                        candidate.key
+                    )));
+                }
                 HeadArchiveObject::Missing => {
+                    upload_result?;
                     return Err(io::Error::other(format!(
                         "uploaded object is missing at s3://{bucket}/{}; local file preserved",
                         candidate.key
@@ -1011,6 +1023,7 @@ fn upload_archive_file(
     let destination = format!("s3://{bucket}/{key}");
     let metadata = format!("sha256={sha256}");
     let output = Command::new("aws")
+        .env("AWS_MAX_ATTEMPTS", "3")
         .args(["s3", "cp"])
         .arg(path)
         .arg(&destination)
@@ -1023,6 +1036,10 @@ fn upload_archive_file(
             &metadata,
             "--checksum-algorithm",
             "SHA256",
+            "--cli-connect-timeout",
+            "30",
+            "--cli-read-timeout",
+            "300",
             "--no-progress",
         ])
         .output()?;
