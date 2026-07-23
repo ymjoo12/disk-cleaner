@@ -119,6 +119,8 @@ struct ArchivePolicy {
     partition_by_date: bool,
     #[serde(default)]
     hardlink_aliases: Vec<String>,
+    #[serde(default)]
+    allow_model_directories: bool,
 }
 
 impl Config {
@@ -208,6 +210,7 @@ struct ResolvedArchivePolicy {
     excludes: Vec<PathBuf>,
     partition_by_date: bool,
     hardlink_aliases: Vec<PathBuf>,
+    allow_model_directories: bool,
 }
 
 #[derive(Debug)]
@@ -644,6 +647,7 @@ fn resolve_archive_policies(
             excludes,
             partition_by_date: policy.partition_by_date,
             hardlink_aliases,
+            allow_model_directories: policy.allow_model_directories,
         });
     }
 
@@ -743,7 +747,10 @@ fn collect_archive_candidates(policies: &[ResolvedArchivePolicy]) -> ArchiveScan
             }
 
             let path = entry.path();
-            if is_excluded(&path, &policy.excludes) || is_model_path(&path) {
+            if is_excluded(&path, &policy.excludes)
+                || is_model_file_extension(&path)
+                || (!policy.allow_model_directories && is_model_directory(&path))
+            {
                 continue;
             }
             let metadata = match entry.metadata() {
@@ -820,17 +827,21 @@ fn is_archive_age_candidate(modified: SystemTime, now: SystemTime, older_than: D
 }
 
 fn is_model_path(path: &Path) -> bool {
-    if path.components().any(|component| {
+    is_model_directory(path) || is_model_file_extension(path)
+}
+
+fn is_model_directory(path: &Path) -> bool {
+    path.components().any(|component| {
         component.as_os_str().to_str().is_some_and(|value| {
             matches!(
                 value.to_ascii_lowercase().as_str(),
                 "models" | "checkpoints"
             )
         })
-    }) {
-        return true;
-    }
+    })
+}
 
+fn is_model_file_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| {
@@ -2447,6 +2458,15 @@ mod tests {
         assert!(!is_model_path(Path::new(
             "/Users/example/archive/render.mov"
         )));
+        assert!(is_model_directory(Path::new(
+            "/Users/example/models/downloads/archive.zip"
+        )));
+        assert!(!is_model_file_extension(Path::new(
+            "/Users/example/models/downloads/archive.zip"
+        )));
+        assert!(is_model_file_extension(Path::new(
+            "/Users/example/downloads/model.pth"
+        )));
     }
 
     #[test]
@@ -2505,6 +2525,7 @@ mod tests {
 
         assert!(!config.archive[0].partition_by_date);
         assert!(config.archive[0].hardlink_aliases.is_empty());
+        assert!(!config.archive[0].allow_model_directories);
     }
 
     #[test]
