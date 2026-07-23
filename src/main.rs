@@ -1,15 +1,17 @@
 use bytesize::ByteSize;
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, Utc};
 use clap::{Parser, Subcommand};
 use colored::*;
 use dialoguer::{theme::ColorfulTheme, Confirm, MultiSelect};
 use indicatif::{ProgressBar, ProgressStyle};
 use jwalk::WalkDir;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io;
-use std::os::unix::fs::FileTypeExt;
+use std::io::{self, Read};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -73,6 +75,17 @@ enum Commands {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    #[command(about = "Archive cold files to S3-compatible storage")]
+    Archive {
+        #[arg(long)]
+        endpoint: String,
+        #[arg(long)]
+        bucket: String,
+        #[arg(long)]
+        profile: String,
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -91,6 +104,19 @@ enum ConfigCommand {
 struct Config {
     #[serde(default)]
     exclude: Vec<String>,
+    #[serde(default)]
+    archive: Vec<ArchivePolicy>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct ArchivePolicy {
+    path: String,
+    prefix: String,
+    older_than_days: u64,
+    #[serde(default)]
+    exclude: Vec<String>,
+    #[serde(default)]
+    partition_by_date: bool,
 }
 
 impl Config {
@@ -173,6 +199,71 @@ struct CleanupReport {
     errors: Vec<String>,
 }
 
+struct ResolvedArchivePolicy {
+    root: PathBuf,
+    prefix: String,
+    older_than: Duration,
+    excludes: Vec<PathBuf>,
+    partition_by_date: bool,
+}
+
+#[derive(Debug)]
+struct ArchiveCandidate {
+    path: PathBuf,
+    key: String,
+    size: u64,
+    root: PathBuf,
+    excludes: Vec<PathBuf>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RemoteObject {
+    content_length: u64,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+    change_time_seconds: i64,
+    change_time_nanoseconds: i64,
+    size: u64,
+    modified: SystemTime,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HeadArchiveObject {
+    Missing,
+    Found(RemoteObject),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ArchiveTransferDecision {
+    Upload,
+    ReuseExisting,
+    Conflict,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DeleteAfterVerification {
+    Deleted,
+    VerificationMismatch,
+    LocalChanged,
+}
+
+#[derive(Default)]
+struct ArchiveReport {
+    archived_files: u64,
+    archived_bytes: u64,
+    errors: Vec<String>,
+}
+
+struct ArchiveScan {
+    candidates: Vec<ArchiveCandidate>,
+    errors: Vec<String>,
+}
+
 impl CleanupReport {
     fn add_error(&mut self, path: &Path, error: impl std::fmt::Display) {
         self.errors.push(format!("{}: {error}", path.display()));
@@ -250,8 +341,20 @@ fn run() -> io::Result<()> {
     let args = Args::parse();
     let home = get_home_dir()?;
 
-    if let Some(Commands::Config { command }) = args.command {
-        return run_config_command(command, args.config.as_deref(), &home);
+    match args.command.as_ref() {
+        Some(Commands::Config { command }) => {
+            return run_config_command(command, args.config.as_deref(), &home);
+        }
+        Some(Commands::Archive {
+            endpoint,
+            bucket,
+            profile,
+            dry_run,
+        }) => {
+            let config = Config::load(args.config.as_deref(), &home)?;
+            return run_archive(&config, &home, endpoint, bucket, profile, *dry_run);
+        }
+        None => {}
     }
 
     if args.list_targets {
@@ -267,7 +370,7 @@ fn run() -> io::Result<()> {
 }
 
 fn run_config_command(
-    command: ConfigCommand,
+    command: &ConfigCommand,
     config_path: Option<&Path>,
     home: &Path,
 ) -> io::Result<()> {
@@ -275,7 +378,7 @@ fn run_config_command(
 
     match command {
         ConfigCommand::AddExclude { path } => {
-            let normalized = display_path(&normalize_path(&path, home), home);
+            let normalized = display_path(&normalize_path(path, home), home);
             if !config.exclude.iter().any(|existing| {
                 normalize_path(Path::new(existing), home)
                     == normalize_path(Path::new(&normalized), home)
@@ -287,7 +390,7 @@ fn run_config_command(
             println!("Added exclude: {normalized}");
         }
         ConfigCommand::RemoveExclude { path } => {
-            let normalized = normalize_path(&path, home);
+            let normalized = normalize_path(path, home);
             let before = config.exclude.len();
             config
                 .exclude
@@ -314,6 +417,687 @@ fn run_config_command(
         }
     }
 
+    Ok(())
+}
+
+fn run_archive(
+    config: &Config,
+    home: &Path,
+    endpoint: &str,
+    bucket: &str,
+    profile: &str,
+    dry_run: bool,
+) -> io::Result<()> {
+    validate_archive_destination(endpoint, bucket, profile)?;
+    let policies = resolve_archive_policies(config, home)?;
+    ensure_aws_available()?;
+    let mut scan = collect_archive_candidates(&policies);
+    let total_bytes = scan
+        .candidates
+        .iter()
+        .map(|candidate| candidate.size)
+        .sum::<u64>();
+
+    println!(
+        "Archive candidates: {} files ({})",
+        scan.candidates.len(),
+        ByteSize(total_bytes)
+    );
+
+    if dry_run {
+        println!("Dry run mode - no files will be uploaded or deleted.");
+        for candidate in &scan.candidates {
+            println!(
+                "  {} -> s3://{}/{} ({})",
+                candidate.path.display(),
+                bucket,
+                candidate.key,
+                ByteSize(candidate.size)
+            );
+        }
+        if scan.errors.is_empty() {
+            return Ok(());
+        }
+        eprintln!("Archive scan errors:");
+        for error in &scan.errors {
+            eprintln!("  {error}");
+        }
+        return Err(io::Error::other(format!(
+            "archive scan completed with {} error(s)",
+            scan.errors.len()
+        )));
+    }
+
+    let mut report = ArchiveReport {
+        errors: std::mem::take(&mut scan.errors),
+        ..ArchiveReport::default()
+    };
+    for candidate in &scan.candidates {
+        match archive_candidate(candidate, endpoint, bucket, profile) {
+            Ok(size) => {
+                report.archived_files += 1;
+                report.archived_bytes += size;
+                if let Err(error) = prune_empty_ancestors(
+                    candidate.path.parent(),
+                    &candidate.root,
+                    &candidate.excludes,
+                ) {
+                    report.errors.push(format!(
+                        "{}: failed to remove an empty directory: {error}",
+                        candidate.path.display()
+                    ));
+                }
+            }
+            Err(error) => report
+                .errors
+                .push(format!("{}: {error}", candidate.path.display())),
+        }
+    }
+
+    finish_archive_report(report)
+}
+
+fn finish_archive_report(report: ArchiveReport) -> io::Result<()> {
+    println!(
+        "Archived {} files ({})",
+        report.archived_files,
+        ByteSize(report.archived_bytes)
+    );
+    if report.errors.is_empty() {
+        return Ok(());
+    }
+
+    eprintln!("Archive errors:");
+    for error in &report.errors {
+        eprintln!("  {error}");
+    }
+    Err(io::Error::other(format!(
+        "archive completed with {} error(s)",
+        report.errors.len()
+    )))
+}
+
+fn validate_archive_destination(endpoint: &str, bucket: &str, profile: &str) -> io::Result<()> {
+    if !(endpoint.starts_with("https://") || endpoint.starts_with("http://"))
+        || endpoint.chars().any(char::is_whitespace)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "archive endpoint must be an HTTP or HTTPS URL without whitespace",
+        ));
+    }
+    if bucket.is_empty()
+        || bucket.len() > 255
+        || bucket.starts_with('-')
+        || bucket.ends_with('-')
+        || !bucket
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "archive bucket contains unsupported characters",
+        ));
+    }
+    if profile.trim().is_empty() || profile.chars().any(char::is_control) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "archive profile must not be empty or contain control characters",
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_archive_policies(
+    config: &Config,
+    home: &Path,
+) -> io::Result<Vec<ResolvedArchivePolicy>> {
+    if config.archive.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no archive policies are configured",
+        ));
+    }
+
+    let global_excludes = merge_excludes(config, &[], home);
+    let mut resolved = Vec::with_capacity(config.archive.len());
+    for policy in &config.archive {
+        validate_archive_prefix(&policy.prefix)?;
+        if policy.older_than_days == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "archive policy {} must use older_than_days greater than zero",
+                    policy.path
+                ),
+            ));
+        }
+        let seconds = policy
+            .older_than_days
+            .checked_mul(24 * 60 * 60)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("archive age is too large for {}", policy.path),
+                )
+            })?;
+        let raw_root = normalize_path(Path::new(&policy.path), home);
+        let root = fs::canonicalize(&raw_root).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to resolve archive path {}: {error}",
+                    raw_root.display()
+                ),
+            )
+        })?;
+        if !root.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("archive path is not a directory: {}", root.display()),
+            ));
+        }
+
+        let mut excludes = global_excludes.clone();
+        for exclude in &policy.exclude {
+            push_unique_path(
+                &mut excludes,
+                resolve_archive_exclude(exclude, &root, home)?,
+            );
+        }
+        resolved.push(ResolvedArchivePolicy {
+            root,
+            prefix: policy.prefix.clone(),
+            older_than: Duration::from_secs(seconds),
+            excludes,
+            partition_by_date: policy.partition_by_date,
+        });
+    }
+
+    for (index, policy) in resolved.iter().enumerate() {
+        for other in resolved.iter().skip(index + 1) {
+            if policy.root.starts_with(&other.root) || other.root.starts_with(&policy.root) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "archive policy paths overlap: {} and {}",
+                        policy.root.display(),
+                        other.root.display()
+                    ),
+                ));
+            }
+        }
+    }
+
+    Ok(resolved)
+}
+
+fn resolve_archive_exclude(exclude: &str, root: &Path, home: &Path) -> io::Result<PathBuf> {
+    let path = Path::new(exclude);
+    let resolved = if path.is_absolute() || exclude == "~" || exclude.starts_with("~/") {
+        normalize_path(path, home)
+    } else {
+        if path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::RootDir
+            )
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("archive exclude must not escape its policy path: {exclude}"),
+            ));
+        }
+        root.join(path)
+    };
+    Ok(fs::canonicalize(&resolved).unwrap_or(resolved))
+}
+
+fn validate_archive_prefix(prefix: &str) -> io::Result<()> {
+    if prefix.is_empty()
+        || prefix.trim() != prefix
+        || prefix.starts_with('/')
+        || prefix.ends_with('/')
+        || prefix.contains('\\')
+        || prefix
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid archive prefix: {prefix}"),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_aws_available() -> io::Result<()> {
+    match Command::new("aws").arg("--version").output() {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "aws CLI is unavailable: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        )),
+        Err(error) => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("aws CLI is unavailable: {error}"),
+        )),
+    }
+}
+
+fn collect_archive_candidates(policies: &[ResolvedArchivePolicy]) -> ArchiveScan {
+    let now = SystemTime::now();
+    let mut candidates = Vec::new();
+    let mut errors = Vec::new();
+    let mut seen = HashSet::new();
+    let mut key_sources: HashMap<String, PathBuf> = HashMap::new();
+    let mut conflicting_keys = HashSet::new();
+
+    for policy in policies {
+        for entry in WalkDir::new(&policy.root).skip_hidden(false).into_iter() {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    errors.push(format!("{}: {error}", policy.root.display()));
+                    continue;
+                }
+            };
+            if !entry.file_type().is_file() {
+                continue;
+            }
+
+            let path = entry.path();
+            if is_excluded(&path, &policy.excludes) || is_model_path(&path) {
+                continue;
+            }
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    errors.push(format!("{}: {error}", path.display()));
+                    continue;
+                }
+            };
+            let modified = match metadata.modified() {
+                Ok(modified) => modified,
+                Err(error) => {
+                    errors.push(format!("{}: {error}", path.display()));
+                    continue;
+                }
+            };
+            if !is_archive_age_candidate(modified, now, policy.older_than) {
+                continue;
+            }
+            if !seen.insert(path.clone()) {
+                errors.push(format!(
+                    "{}: file matched more than one archive policy",
+                    path.display()
+                ));
+                continue;
+            }
+            let relative = match path.strip_prefix(&policy.root) {
+                Ok(relative) => relative,
+                Err(error) => {
+                    errors.push(format!("{}: {error}", path.display()));
+                    continue;
+                }
+            };
+            let partition_time = policy.partition_by_date.then_some(modified);
+            match build_archive_key(&policy.prefix, relative, partition_time) {
+                Ok(key) => {
+                    if let Some(previous) = key_sources.get(&key) {
+                        errors.push(format!(
+                            "{} and {} resolve to the same S3 key {key}",
+                            previous.display(),
+                            path.display()
+                        ));
+                        conflicting_keys.insert(key.clone());
+                    } else {
+                        key_sources.insert(key.clone(), path.clone());
+                    }
+                    candidates.push(ArchiveCandidate {
+                        path,
+                        key,
+                        size: metadata.len(),
+                        root: policy.root.clone(),
+                        excludes: policy.excludes.clone(),
+                    });
+                }
+                Err(error) => errors.push(format!("{}: {error}", path.display())),
+            }
+        }
+    }
+
+    candidates.retain(|candidate| !conflicting_keys.contains(&candidate.key));
+    candidates.sort_by(|left, right| left.path.cmp(&right.path));
+    ArchiveScan { candidates, errors }
+}
+
+fn is_archive_age_candidate(modified: SystemTime, now: SystemTime, older_than: Duration) -> bool {
+    now.duration_since(modified)
+        .map(|age| age >= older_than)
+        .unwrap_or(false)
+}
+
+fn is_model_path(path: &Path) -> bool {
+    if path.components().any(|component| {
+        component.as_os_str().to_str().is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "models" | "checkpoints"
+            )
+        })
+    }) {
+        return true;
+    }
+
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "safetensors" | "ckpt" | "pt" | "pth" | "bin" | "gguf" | "onnx"
+            )
+        })
+}
+
+fn build_archive_key(
+    prefix: &str,
+    relative: &Path,
+    partition_time: Option<SystemTime>,
+) -> Result<String, String> {
+    validate_archive_prefix(prefix).map_err(|error| error.to_string())?;
+    let mut components = Vec::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(value) => components.push(
+                value
+                    .to_str()
+                    .ok_or_else(|| "archive path is not valid UTF-8".to_string())?,
+            ),
+            _ => return Err("archive path contains an unsafe component".to_string()),
+        }
+    }
+    if components.is_empty() {
+        return Err("archive path has no relative file name".to_string());
+    }
+    let prefix = match partition_time {
+        Some(time) => {
+            let date: DateTime<Utc> = time.into();
+            format!("{prefix}/{}", date.format("%Y/%m/%d"))
+        }
+        None => prefix.to_string(),
+    };
+    Ok(format!("{prefix}/{}", components.join("/")))
+}
+
+fn archive_candidate(
+    candidate: &ArchiveCandidate,
+    endpoint: &str,
+    bucket: &str,
+    profile: &str,
+) -> io::Result<u64> {
+    let metadata_before = fs::metadata(&candidate.path)?;
+    let identity_before = file_identity(&metadata_before)?;
+    let sha256 = sha256_file(&candidate.path)?;
+    let metadata_after = fs::metadata(&candidate.path)?;
+    let expected_identity = file_identity(&metadata_after)?;
+    if identity_before != expected_identity {
+        return Err(io::Error::other(
+            "local file changed while calculating SHA-256; local file preserved",
+        ));
+    }
+
+    let existing = head_archive_object(&candidate.key, endpoint, bucket, profile)?;
+    let remote = match existing {
+        HeadArchiveObject::Missing => {
+            upload_archive_file(
+                &candidate.path,
+                &candidate.key,
+                &sha256,
+                endpoint,
+                bucket,
+                profile,
+            )?;
+            match head_archive_object(&candidate.key, endpoint, bucket, profile)? {
+                HeadArchiveObject::Found(remote) => remote,
+                HeadArchiveObject::Missing => {
+                    return Err(io::Error::other(format!(
+                        "uploaded object is missing at s3://{bucket}/{}; local file preserved",
+                        candidate.key
+                    )));
+                }
+            }
+        }
+        HeadArchiveObject::Found(remote) => {
+            match decide_archive_transfer(Some(&remote), expected_identity.size, &sha256) {
+                ArchiveTransferDecision::ReuseExisting => remote,
+                ArchiveTransferDecision::Conflict => {
+                    return Err(io::Error::other(format!(
+                    "existing object differs at s3://{bucket}/{}; object was not overwritten and local file was preserved",
+                    candidate.key
+                )));
+                }
+                ArchiveTransferDecision::Upload => unreachable!(),
+            }
+        }
+    };
+
+    match delete_after_verification(&candidate.path, &expected_identity, &sha256, &remote)? {
+        DeleteAfterVerification::Deleted => Ok(expected_identity.size),
+        DeleteAfterVerification::VerificationMismatch => Err(io::Error::other(format!(
+            "remote verification failed for s3://{bucket}/{}; local file preserved",
+            candidate.key
+        ))),
+        DeleteAfterVerification::LocalChanged => Err(io::Error::other(format!(
+            "local file changed during upload to s3://{bucket}/{}; local file preserved",
+            candidate.key
+        ))),
+    }
+}
+
+fn file_identity(metadata: &fs::Metadata) -> io::Result<FileIdentity> {
+    Ok(FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        change_time_seconds: metadata.ctime(),
+        change_time_nanoseconds: metadata.ctime_nsec(),
+        size: metadata.len(),
+        modified: metadata.modified()?,
+    })
+}
+
+fn decide_archive_transfer(
+    existing: Option<&RemoteObject>,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> ArchiveTransferDecision {
+    match existing {
+        None => ArchiveTransferDecision::Upload,
+        Some(remote)
+            if remote.content_length == expected_size
+                && remote.sha256.eq_ignore_ascii_case(expected_sha256) =>
+        {
+            ArchiveTransferDecision::ReuseExisting
+        }
+        Some(_) => ArchiveTransferDecision::Conflict,
+    }
+}
+
+fn sha256_file(path: &Path) -> io::Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn upload_archive_file(
+    path: &Path,
+    key: &str,
+    sha256: &str,
+    endpoint: &str,
+    bucket: &str,
+    profile: &str,
+) -> io::Result<()> {
+    let destination = format!("s3://{bucket}/{key}");
+    let metadata = format!("sha256={sha256}");
+    let output = Command::new("aws")
+        .args(["s3", "cp"])
+        .arg(path)
+        .arg(&destination)
+        .args([
+            "--endpoint-url",
+            endpoint,
+            "--profile",
+            profile,
+            "--metadata",
+            &metadata,
+            "--no-progress",
+        ])
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "upload failed for {destination}: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    )))
+}
+
+fn head_archive_object(
+    key: &str,
+    endpoint: &str,
+    bucket: &str,
+    profile: &str,
+) -> io::Result<HeadArchiveObject> {
+    let output = Command::new("aws")
+        .args([
+            "s3api",
+            "head-object",
+            "--bucket",
+            bucket,
+            "--key",
+            key,
+            "--endpoint-url",
+            endpoint,
+            "--profile",
+            profile,
+            "--output",
+            "json",
+        ])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if is_head_object_not_found(&stderr) {
+            return Ok(HeadArchiveObject::Missing);
+        }
+        return Err(io::Error::other(format!(
+            "head-object failed for s3://{bucket}/{key}: {}",
+            stderr.trim()
+        )));
+    }
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid head-object response for s3://{bucket}/{key}: {error}"),
+        )
+    })?;
+    let content_length = value
+        .get("ContentLength")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("head-object response lacks ContentLength for s3://{bucket}/{key}"),
+            )
+        })?;
+    let sha256 = value
+        .get("Metadata")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|metadata| {
+            metadata.iter().find_map(|(name, value)| {
+                name.eq_ignore_ascii_case("sha256")
+                    .then(|| value.as_str())
+                    .flatten()
+            })
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("head-object response lacks Metadata.sha256 for s3://{bucket}/{key}"),
+            )
+        })?
+        .to_string();
+    Ok(HeadArchiveObject::Found(RemoteObject {
+        content_length,
+        sha256,
+    }))
+}
+
+fn is_head_object_not_found(stderr: &str) -> bool {
+    [
+        "An error occurred (404)",
+        "An error occurred (NotFound)",
+        "An error occurred (NoSuchKey)",
+        "status code: 404",
+    ]
+    .iter()
+    .any(|marker| stderr.contains(marker))
+}
+
+fn delete_after_verification(
+    path: &Path,
+    expected_identity: &FileIdentity,
+    expected_sha256: &str,
+    remote: &RemoteObject,
+) -> io::Result<DeleteAfterVerification> {
+    if remote.content_length != expected_identity.size
+        || !remote.sha256.eq_ignore_ascii_case(expected_sha256)
+    {
+        return Ok(DeleteAfterVerification::VerificationMismatch);
+    }
+
+    let metadata = fs::metadata(path)?;
+    if file_identity(&metadata)? != *expected_identity {
+        return Ok(DeleteAfterVerification::LocalChanged);
+    }
+    fs::remove_file(path)?;
+    Ok(DeleteAfterVerification::Deleted)
+}
+
+fn prune_empty_ancestors(
+    start: Option<&Path>,
+    root: &Path,
+    excludes: &[PathBuf],
+) -> io::Result<()> {
+    let Some(mut current) = start.map(PathBuf::from) else {
+        return Ok(());
+    };
+    while current.starts_with(root) && current != root {
+        if is_excluded(&current, excludes) || is_model_path(&current) {
+            break;
+        }
+        match fs::remove_dir(&current) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => break,
+            Err(error) => return Err(error),
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent.to_path_buf();
+    }
     Ok(())
 }
 
@@ -1532,6 +2316,7 @@ mod tests {
         let home = Path::new("/Users/example");
         let config = Config {
             exclude: vec!["~/Codes/keep".to_string()],
+            archive: Vec::new(),
         };
         let cli = vec![PathBuf::from("~/Downloads/keep")];
 
@@ -1572,6 +2357,169 @@ mod tests {
         assert_eq!(report.freed, 20);
         assert_eq!(report.errors.len(), 1);
         assert!(report.errors[0].contains("first"));
+    }
+
+    #[test]
+    fn model_paths_and_extensions_are_protected() {
+        assert!(is_model_path(Path::new(
+            "/Users/example/archive/models/output.mov"
+        )));
+        assert!(is_model_path(Path::new(
+            "/Users/example/archive/checkpoints/data.json"
+        )));
+        assert!(is_model_path(Path::new(
+            "/Users/example/archive/render.SAFETENSORS"
+        )));
+        assert!(is_model_path(Path::new(
+            "/Users/example/archive/network.onnx"
+        )));
+        assert!(!is_model_path(Path::new(
+            "/Users/example/archive/render.mov"
+        )));
+    }
+
+    #[test]
+    fn archive_age_selection_uses_modification_age() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100 * 24 * 60 * 60);
+        let old = now - Duration::from_secs(31 * 24 * 60 * 60);
+        let recent = now - Duration::from_secs(29 * 24 * 60 * 60);
+        let threshold = Duration::from_secs(30 * 24 * 60 * 60);
+
+        assert!(is_archive_age_candidate(old, now, threshold));
+        assert!(!is_archive_age_candidate(recent, now, threshold));
+        assert!(!is_archive_age_candidate(
+            now + Duration::from_secs(1),
+            now,
+            threshold
+        ));
+    }
+
+    #[test]
+    fn archive_key_preserves_relative_path() {
+        assert_eq!(
+            build_archive_key("cold/projects", Path::new("vyt/renders/final.mp4"), None).unwrap(),
+            "cold/projects/vyt/renders/final.mp4"
+        );
+        assert!(build_archive_key("/unsafe", Path::new("file.txt"), None).is_err());
+        assert!(build_archive_key("unsafe/../escape", Path::new("file.txt"), None).is_err());
+    }
+
+    #[test]
+    fn archive_key_partitions_by_utc_modification_date() {
+        assert_eq!(
+            build_archive_key(
+                "cold/projects",
+                Path::new("vyt/renders/final.mp4"),
+                Some(SystemTime::UNIX_EPOCH)
+            )
+            .unwrap(),
+            "cold/projects/1970/01/01/vyt/renders/final.mp4"
+        );
+    }
+
+    #[test]
+    fn config_without_archive_field_is_backward_compatible() {
+        let config: Config = serde_json::from_str(r#"{"exclude":["~/Codes/keep"]}"#).unwrap();
+
+        assert_eq!(config.exclude, vec!["~/Codes/keep"]);
+        assert!(config.archive.is_empty());
+    }
+
+    #[test]
+    fn archive_policy_without_partition_field_is_backward_compatible() {
+        let config: Config = serde_json::from_str(
+            r#"{"archive":[{"path":"~/Movies","prefix":"cold","older_than_days":30}]}"#,
+        )
+        .unwrap();
+
+        assert!(!config.archive[0].partition_by_date);
+    }
+
+    #[test]
+    fn verification_failure_preserves_local_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("archive.dat");
+        fs::write(&path, b"archive payload").unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let identity = file_identity(&metadata).unwrap();
+        let remote = RemoteObject {
+            content_length: metadata.len(),
+            sha256: "incorrect".to_string(),
+        };
+
+        let result = delete_after_verification(&path, &identity, "expected", &remote).unwrap();
+
+        assert_eq!(result, DeleteAfterVerification::VerificationMismatch);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn matching_existing_object_is_reused_without_upload() {
+        let remote = RemoteObject {
+            content_length: 42,
+            sha256: "ABC123".to_string(),
+        };
+
+        assert_eq!(
+            decide_archive_transfer(Some(&remote), 42, "abc123"),
+            ArchiveTransferDecision::ReuseExisting
+        );
+    }
+
+    #[test]
+    fn different_existing_object_is_preserved_without_upload() {
+        let remote = RemoteObject {
+            content_length: 42,
+            sha256: "existing".to_string(),
+        };
+
+        assert_eq!(
+            decide_archive_transfer(Some(&remote), 42, "local"),
+            ArchiveTransferDecision::Conflict
+        );
+        assert_eq!(
+            decide_archive_transfer(None, 42, "local"),
+            ArchiveTransferDecision::Upload
+        );
+    }
+
+    #[test]
+    fn file_identity_mismatch_preserves_local_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("archive.dat");
+        fs::write(&path, b"archive payload").unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let mut expected_identity = file_identity(&metadata).unwrap();
+        expected_identity.inode = expected_identity.inode.wrapping_add(1);
+        let remote = RemoteObject {
+            content_length: metadata.len(),
+            sha256: "expected".to_string(),
+        };
+
+        let result =
+            delete_after_verification(&path, &expected_identity, "expected", &remote).unwrap();
+
+        assert_eq!(result, DeleteAfterVerification::LocalChanged);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn head_object_not_found_does_not_match_access_or_network_errors() {
+        assert!(is_head_object_not_found(
+            "An error occurred (404) when calling the HeadObject operation: Not Found"
+        ));
+        assert!(is_head_object_not_found(
+            "An error occurred (NoSuchKey) when calling the HeadObject operation"
+        ));
+        assert!(!is_head_object_not_found(
+            "The config profile (archive) could not be found"
+        ));
+        assert!(!is_head_object_not_found(
+            "Could not connect to the endpoint URL"
+        ));
+        assert!(!is_head_object_not_found(
+            "An error occurred (AccessDenied) when calling the HeadObject operation"
+        ));
     }
 
     fn test_item(id: &'static str, group: TargetGroup, size: u64) -> CleanableItem {

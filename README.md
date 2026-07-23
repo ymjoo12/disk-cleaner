@@ -14,6 +14,7 @@ Fast parallel disk space analyzer and cleaner for macOS.
 - Non-interactive cleanup by target ID or group
 - Runtime and saved exclude paths
 - Dry-run mode
+- Verified cold-file archival to S3-compatible storage
 
 ## Installation
 
@@ -57,6 +58,12 @@ disk-cleaner --large 500
 
 # Exclude paths for one run
 disk-cleaner --scan-only --exclude ~/Codes/important --exclude ~/Downloads/keep
+
+# Preview configured cold-file archival
+disk-cleaner archive --endpoint https://s3.example.com --bucket archives --profile archive --dry-run
+
+# Upload, verify, and remove configured cold files
+disk-cleaner archive --endpoint https://s3.example.com --bucket archives --profile archive
 ```
 
 ## Saved Exclude Paths
@@ -76,6 +83,46 @@ disk-cleaner config path
 ```
 
 The default config path is `~/.config/disk-cleaner/config.json`.
+
+## Cold-File Archive
+
+Archive policies are stored in the same config file. Existing config files without an `archive` field remain valid.
+
+```json
+{
+  "exclude": [
+    "~/Codes/important"
+  ],
+  "archive": [
+    {
+      "path": "~/Movies/renders",
+      "prefix": "cold/renders",
+      "older_than_days": 30,
+      "partition_by_date": true,
+      "exclude": [
+        "active-project",
+        "~/Movies/renders/keep"
+      ]
+    }
+  ]
+}
+```
+
+Each regular file older than the policy threshold keeps its path relative to the policy root. With `partition_by_date` omitted or set to `false`, `~/Movies/renders/client/final.mp4` is stored as `s3://archives/cold/renders/client/final.mp4`. When `partition_by_date` is `true`, the file modification time is converted to UTC and the key becomes `s3://archives/cold/renders/YYYY/MM/DD/client/final.mp4`. Relative policy excludes are resolved from the policy root. Absolute and `~/` excludes are also supported.
+
+The archive command requires the AWS CLI and an existing AWS CLI profile. It calculates the local SHA-256 and checks the destination with `head-object` before uploading. A missing key is uploaded with the SHA-256 in the `sha256` object metadata field. An existing object is reused without uploading only when both `ContentLength` and `Metadata.sha256` match; a different existing object is never overwritten. Authentication and network failures are not treated as missing objects. The local file is removed only after remote verification and a second local identity check covering device, inode, change time, size, and modification time. Failed files remain local, later files continue processing, and the command exits with a nonzero status after reporting all failures. Only empty ancestor directories created by successful file removal are removed.
+
+Paths containing a `models` or `checkpoints` component are always excluded. Files with the following extensions are also always excluded:
+
+- `.safetensors`
+- `.ckpt`
+- `.pt`
+- `.pth`
+- `.bin`
+- `.gguf`
+- `.onnx`
+
+Archive prefixes must be non-empty relative paths without leading or trailing slashes, backslashes, empty components, `.` components, or `..` components. Archive policy roots must exist, `older_than_days` must be greater than zero, and policy roots must not overlap.
 
 ## Clean Targets
 
@@ -141,3 +188,6 @@ Target IDs:
 - Permission errors are reported as warnings and do not stop later cleanup targets
 - Docker cleanup only removes unused resources
 - Docker cleanup options are hidden when Docker is unavailable or unresponsive
+- Archive dry-run does not upload or delete files
+- Archive verification failure always preserves the local file
+- Model paths and model file extensions are always excluded from archival
