@@ -14,7 +14,7 @@ use std::io::{self, Read};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -22,6 +22,7 @@ use std::time::{Duration, Instant, SystemTime};
 const DOCKER_INFO_TIMEOUT: Duration = Duration::from_millis(750);
 const DOCKER_SCAN_TIMEOUT: Duration = Duration::from_secs(2);
 const DOCKER_PRUNE_TIMEOUT: Duration = Duration::from_secs(30);
+const ARCHIVE_WORKERS: usize = 3;
 
 #[derive(Parser, Debug)]
 #[command(name = "disk-cleaner")]
@@ -481,8 +482,41 @@ fn run_archive(
         errors: std::mem::take(&mut scan.errors),
         ..ArchiveReport::default()
     };
-    for candidate in &scan.candidates {
-        match archive_candidate(candidate, endpoint, bucket, profile) {
+    let next_candidate = AtomicUsize::new(0);
+    let archive_results = thread::scope(|scope| -> io::Result<Vec<_>> {
+        let worker_count = ARCHIVE_WORKERS.min(scan.candidates.len());
+        let handles = (0..worker_count)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut results = Vec::new();
+                    loop {
+                        let index = next_candidate.fetch_add(1, Ordering::Relaxed);
+                        let Some(candidate) = scan.candidates.get(index) else {
+                            break;
+                        };
+                        results.push((
+                            index,
+                            archive_candidate(candidate, endpoint, bucket, profile),
+                        ));
+                    }
+                    results
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut results = Vec::with_capacity(scan.candidates.len());
+        for handle in handles {
+            results.extend(
+                handle
+                    .join()
+                    .map_err(|_| io::Error::other("archive worker panicked"))?,
+            );
+        }
+        results.sort_by_key(|(index, _)| *index);
+        Ok(results)
+    })?;
+    for (index, result) in archive_results {
+        let candidate = &scan.candidates[index];
+        match result {
             Ok(size) => {
                 report.archived_files += 1;
                 report.archived_bytes += size;
